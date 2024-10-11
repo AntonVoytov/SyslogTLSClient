@@ -1,6 +1,17 @@
 #ifndef _SYSLOG_H_
 #define _SYSLOG_H_
 
+#include <cstdio>
+#include <cstdint>
+#include <string>
+#include <chrono>
+#include <ctime>
+#include <format>
+#include <filesystem>
+#include <thread>
+
+#include <windows.h>
+
 #define OPENSSL_API_COMPAT 30300    // Compatibility with OpenSSL 3.3.0 (including 3.3.1)
 #define OPENSSL_NO_DEPRECATED       // Disable deprecated functions
 
@@ -110,7 +121,8 @@ class SyslogTLSClient
 {
 public:
     explicit SyslogTLSClient(const std::string & serverIP, const std::string & port,
-                             const std::string & serverCertPath, const std::string & clientCertPath = std::string());
+                             const std::string & rootCertPath, const std::string & clientCertPath,
+                             const int depth);
     ~SyslogTLSClient();
 
     SyslogTLSClient() = delete;
@@ -130,27 +142,36 @@ public:
      * @param message The syslog message to be sent. This should be a properly formatted 
      *                syslog message string.
      * 
+     * @param message Number of retries to send message. -1 infinite retries.
+     * 
      * @return true if the message was successfully sent, false otherwise.
      * 
      * @note Ensure that the server address and port are correctly configured before calling 
      *       this method. If the connection to the server is lost during the sending process, 
      *       the method will attempt to reconnect and resend the message.
      */
-    bool sendSyslogMessage(const std::string & message);
+    bool sendSyslogMessage(const std::string & message, int retries = -1);
 
 private:
     bool initialize();
     bool connect();
     void cleanup();
+    bool setProtocolVersion();
+    bool setClientCertificate();
+    bool setVerifyServerCertificate();
+    bool connectAndHandshake();
+    bool internalSend(const std::string & message, int & retries);
 
 private:
-    std::string serverCertPath_;
+    std::string rootCertPath_;
     std::string clientCertPath_;
     std::string serverIP_;
     std::string port_;
     SSL_CTX * ctx_;
     SSL * ssl_;
     BIO * bio_;
+
+    int depth_;
 
     bool isInitialized_;
     bool isConnected_;

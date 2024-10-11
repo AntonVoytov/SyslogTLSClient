@@ -1,14 +1,3 @@
-#include <cstdio>
-#include <cstdint>
-#include <string>
-#include <chrono>
-#include <ctime>
-#include <format>
-#include <filesystem>
-#include <thread>
-
-#include <windows.h>
-
 #include "syslog.hpp"
 
 std::string getLastErrorAsString()
@@ -61,7 +50,7 @@ std::string SyslogMessageFormatter::format(const Facility facility, const Severi
     }
 
     const auto priority = static_cast<uint8_t>(facility) * 8 + static_cast<uint8_t>(severity);
-    return std::format("<{}>{} {} {} {} {} {} {} {}",
+    return std::format("<{}>{} {} {} {} {} {} {} {}\n",
                        priority,
                        syslogVersion_,
                        getTimeStamp().c_str(),
@@ -83,7 +72,7 @@ std::string SyslogMessageFormatter::format(const Facility facility, const Severi
     }
 
     const auto priority = static_cast<uint8_t>(facility) * 8 + static_cast<uint8_t>(severity);
-    return std::format("<{}>{} {} {} {} {} {} {} {}",
+    return std::format("<{}>{} {} {} {} {} {} {} {}\n",
                        priority,
                        syslogVersion_,
                        getTimeStamp().c_str(),
@@ -154,15 +143,29 @@ std::string SyslogMessageFormatter::getTimeStamp() const
                        miliseconds.count());
 }
 
+int checkCertificate(int preverify, X509_STORE_CTX * ctx)
+{
+    if (preverify == 0)
+    {
+        const char * errorMessage = X509_verify_cert_error_string(X509_STORE_CTX_get_error(ctx));
+        std::printf("Certificate verification failed. Reason - %s\n", errorMessage);
+        return 0;
+    }
+
+    return 1;
+}
+
 SyslogTLSClient::SyslogTLSClient(const std::string & serverIP, const std::string & port,
-                                 const std::string & serverCertPath, const std::string & clientCertPath)
-    : serverCertPath_(serverCertPath)
+                                 const std::string & rootCertPath, const std::string & clientCertPath,
+                                 const int depth)
+    : rootCertPath_(rootCertPath)
     , clientCertPath_(clientCertPath)
     , serverIP_(serverIP)
     , port_(port)
     , ssl_(nullptr)
     , ctx_(nullptr)
     , bio_(nullptr)
+    , depth_(depth)
     , isInitialized_(false)
     , isConnected_(false)
 {}
@@ -172,9 +175,16 @@ SyslogTLSClient::~SyslogTLSClient()
     cleanup();
 }
 
-bool SyslogTLSClient::sendSyslogMessage(const std::string & message)
+bool SyslogTLSClient::sendSyslogMessage(const std::string & message, int retries)
 {
-    do
+    if (message.empty())
+    {
+        std::printf("Skipping sending empty message\n");
+        return false;
+    }
+
+    bool isResend = true;
+    while (isResend)
     {
         if (!initialize())
         {
@@ -186,16 +196,14 @@ bool SyslogTLSClient::sendSyslogMessage(const std::string & message)
             return false;
         }
 
-        if (BIO_write(bio_, message.c_str(), static_cast<int>(message.size()) + 1) <= 0)
+        if (!internalSend(message, retries))
         {
-            std::printf("Failed to send syslog message. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-            std::printf("Trying to reconnect to send message\n");
-            cleanup();
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            isResend = retries == -1 || retries > 0;
             continue;
         }
+
+        break;
     }
-    while (false);
 
     return true;
 }
@@ -207,64 +215,19 @@ bool SyslogTLSClient::initialize()
         return isInitialized_;
     }
 
-    if (OSSL_PROVIDER_load(nullptr, "default") == nullptr)
+    if (!setProtocolVersion())
     {
-        std::printf("Failed to load default provider. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return isInitialized_;
+        return false;
     }
 
-    ctx_ = SSL_CTX_new(TLS_client_method());
-    if (ctx_ == nullptr)
+    if (!setClientCertificate())
     {
-        std::printf("Failed to create SSL context. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return isInitialized_;
+        return false;
     }
 
-    if (SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION) == 0)
+    if (!setVerifyServerCertificate())
     {
-        std::printf("Failed to set min proto version. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return isInitialized_;
-    }
-
-    if (SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION) == 0)
-    {
-        std::printf("Failed to set max proto version. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return isInitialized_;
-    }
-
-    if (!std::filesystem::exists(serverCertPath_))
-    {
-        std::printf("Server sertification file does not exist by this path - %s\n", serverCertPath_.c_str());
-        return isInitialized_;
-    }
-
-    if (SSL_CTX_load_verify_locations(ctx_, serverCertPath_.c_str(), NULL) == 0)
-    {
-        std::printf("Failed to load CA certificates. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return isInitialized_;
-    }
-
-    /*For mutual handshake*/
-    if (std::filesystem::exists(clientCertPath_))
-    {
-        if (SSL_CTX_use_certificate_file(ctx_, clientCertPath_.c_str(), SSL_FILETYPE_PEM) == 0)
-        {
-            std::printf("Failed to load client certificate. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-            return false;
-        }
-
-        const std::string privateKeyFilePath = std::filesystem::path(clientCertPath_).replace_extension("key").string();
-        if (SSL_CTX_use_PrivateKey_file(ctx_, privateKeyFilePath.c_str(), SSL_FILETYPE_PEM) == 0)
-        {
-            std::printf("Failed to load client private key. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-            return false;
-        }
-
-        if (SSL_CTX_check_private_key(ctx_) == 0)
-        {
-            std::printf("Client private key does not match certificate. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-            return false;
-        }
+        return false;
     }
 
     isInitialized_ = true;
@@ -278,51 +241,13 @@ bool SyslogTLSClient::connect()
         return isConnected_;
     }
 
-    bio_ = BIO_new_ssl_connect(ctx_);
-    if (bio_ == nullptr)
+    if (!connectAndHandshake())
     {
-        std::printf("Failed to create BIO object. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
         return false;
     }
 
-    if (BIO_get_ssl(bio_, &ssl_) == 0)
-    {
-        std::printf("Failed to retrieve SSL object. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return false;
-    }
-
-    if (SSL_set_tlsext_host_name(ssl_, serverIP_.c_str()) == 0)
-    {
-        std::printf("Failed to set tls host name. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return false;
-    }
-
-    const std::string bioAddress = serverIP_ + ":" + port_;
-    if (BIO_set_conn_hostname(bio_, bioAddress.c_str()) == 0)
-    {
-        std::printf("Failed to set connection hostname to BIO object. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return false;
-    }
-
-    SSL_set_verify(ssl_, SSL_VERIFY_PEER, nullptr);
-    if (BIO_do_connect(bio_) <= 0)
-    {
-        std::printf("Failed to establish TLS connection. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return false;
-    }
-
-    if (BIO_do_handshake(bio_) <= 0)
-    {
-        std::printf("Failed to complete TLS handshake. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return false;
-    }
-
-    if (SSL_get_verify_result(ssl_) != X509_V_OK)
-    {
-        std::printf("Failed to verify server certificate. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
-        return false;
-    }
-
+    // some servers may need some time before sending message right after connection established
+    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
     isConnected_ = true;
     return isConnected_;
 }
@@ -344,4 +269,154 @@ void SyslogTLSClient::cleanup()
     ssl_ = nullptr;
     isConnected_ = false;
     isInitialized_ = false;
+}
+
+bool SyslogTLSClient::setProtocolVersion()
+{
+    if (OSSL_PROVIDER_load(nullptr, "default") == nullptr)
+    {
+        std::printf("Failed to load default provider. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    ctx_ = SSL_CTX_new(TLS_client_method());
+    if (ctx_ == nullptr)
+    {
+        std::printf("Failed to create SSL context. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    if (SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION) == 0)
+    {
+        std::printf("Failed to set min protocol version. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    if (SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION) == 0)
+    {
+        std::printf("Failed to set max protocol version. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    return true;
+}
+
+bool SyslogTLSClient::setClientCertificate()
+{
+    if (!std::filesystem::exists(clientCertPath_))
+    {
+        std::printf("Client certification file does not exist by this path - %s\n", clientCertPath_.c_str());
+        return isInitialized_;
+    }
+
+    if (SSL_CTX_use_certificate_file(ctx_, clientCertPath_.c_str(), SSL_FILETYPE_PEM) == 0)
+    {
+        std::printf("Failed to load client certificate. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    const std::string privateKeyFilePath = std::filesystem::path(clientCertPath_).replace_extension("key").string();
+    if (SSL_CTX_use_PrivateKey_file(ctx_, privateKeyFilePath.c_str(), SSL_FILETYPE_PEM) == 0)
+    {
+        std::printf("Failed to load client private key. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    if (SSL_CTX_check_private_key(ctx_) == 0)
+    {
+        std::printf("Client private key does not match certificate. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    return true;
+}
+
+bool SyslogTLSClient::setVerifyServerCertificate()
+{
+    SSL_CTX_set_verify_depth(ctx_, depth_);
+    if (!std::filesystem::exists(rootCertPath_))
+    {
+        std::printf("Root certification file does not exist by this path - %s\n", rootCertPath_.c_str());
+        return false;
+    }
+
+    if (SSL_CTX_load_verify_locations(ctx_, rootCertPath_.c_str(), NULL) == 0)
+    {
+        std::printf("Failed to load root certificate path for verification. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    // Callback only for custom specific verification
+    SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, checkCertificate);
+    return true;
+}
+
+bool SyslogTLSClient::connectAndHandshake()
+{
+    bio_ = BIO_new_ssl_connect(ctx_);
+    if (bio_ == nullptr)
+    {
+        std::printf("Failed to create BIO object. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    if (BIO_get_ssl(bio_, &ssl_) == 0)
+    {
+        std::printf("Failed to retrieve SSL object. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    if (SSL_set_tlsext_host_name(ssl_, serverIP_.c_str()) == 0)
+    {
+        std::printf("Failed to set tls host name. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    if (BIO_set_conn_hostname(bio_, (serverIP_ + ":" + port_).c_str()) == 0)
+    {
+        std::printf("Failed to set connection hostname to BIO object. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    if (BIO_do_connect(bio_) <= 0)
+    {
+        std::printf("Failed to establish connection and complete TLS handshake. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
+        return false;
+    }
+
+    return true;
+}
+
+bool SyslogTLSClient::internalSend(const std::string & message, int & retries)
+{
+    bool isResend = true;
+    while (isResend && BIO_write(bio_, message.c_str(), static_cast<int>(message.size())) <= 0)
+    {
+        std::string message;
+        const bool isReconnect = !BIO_should_retry(bio_);
+        if (isReconnect)
+        {
+            message = "Trying to reconnect to resend the message.";
+            cleanup();
+        }
+        else
+        {
+            message = "Trying to resend the message.";
+        }
+
+        std::printf("Failed to send syslog message. Reason - %s\n"
+                    "%s\nRetries left = %d\n",
+                    ERR_reason_error_string(ERR_get_error()),
+                    message.c_str(),
+                    retries);
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        isResend = retries == -1 || --retries > 0;
+        if (isReconnect)
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
