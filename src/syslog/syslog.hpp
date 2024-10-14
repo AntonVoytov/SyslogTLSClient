@@ -122,7 +122,7 @@ class SyslogTLSClient
 public:
     explicit SyslogTLSClient(const std::string & serverIP, const std::string & port,
                              const std::string & rootCertPath, const std::string & clientCertPath,
-                             const int depth);
+                             const std::string & clientPrivateKey, const int depth);
     ~SyslogTLSClient();
 
     SyslogTLSClient() = delete;
@@ -165,6 +165,7 @@ private:
 private:
     std::string rootCertPath_;
     std::string clientCertPath_;
+    std::string clientPrivateKey_;
     std::string serverIP_;
     std::string port_;
     SSL_CTX * ctx_;

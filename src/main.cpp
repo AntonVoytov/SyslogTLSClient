@@ -6,7 +6,11 @@ int main()
     const auto message1 = messageFormatter.format(Facility::USER, Severity::S_INFO, "TestId1", "", "This is a test message1");
     const auto message2 = messageFormatter.format(Facility::KERNEL, Severity::S_ALERT, "TestHostName", "testAppName", "", "TestId2", "", "This is a test message2");
 
-    SyslogTLSClient syslogClient("172.31.68.201", "6514", "C:\\testProject\\SyslogTLSClient\\cert_linux\\rootCA.crt", "C:\\testProject\\SyslogTLSClient\\cert_linux\\client.crt", 20);
+    SyslogTLSClient syslogClient("172.31.68.201", "6514",
+                                 "C:\\testProject\\SyslogTLSClient\\cert_linux\\rootCA.crt",
+                                 "C:\\testProject\\SyslogTLSClient\\cert_linux\\client.crt",
+                                 "C:\\testProject\\SyslogTLSClient\\cert_linux\\client.key",
+                                 20);
     bool result = syslogClient.sendSyslogMessage(message1, 5);
     if  (!result)
     {

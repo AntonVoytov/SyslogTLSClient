@@ -29,7 +29,7 @@ std::string getLastErrorAsString()
     {
         std::printf("Failed to free error string buffer");
     }
-
+    
     return message;
 }
 
@@ -157,9 +157,10 @@ int checkCertificate(int preverify, X509_STORE_CTX * ctx)
 
 SyslogTLSClient::SyslogTLSClient(const std::string & serverIP, const std::string & port,
                                  const std::string & rootCertPath, const std::string & clientCertPath,
-                                 const int depth)
+                                 const std::string & clientPrivateKey, const int depth)
     : rootCertPath_(rootCertPath)
     , clientCertPath_(clientCertPath)
+    , clientPrivateKey_(clientPrivateKey)
     , serverIP_(serverIP)
     , port_(port)
     , ssl_(nullptr)
@@ -309,14 +310,19 @@ bool SyslogTLSClient::setClientCertificate()
         return isInitialized_;
     }
 
+    if (!std::filesystem::exists(clientPrivateKey_))
+    {
+        std::printf("Client private key file does not exist by this path - %s\n", clientPrivateKey_.c_str());
+        return isInitialized_;
+    }
+
     if (SSL_CTX_use_certificate_file(ctx_, clientCertPath_.c_str(), SSL_FILETYPE_PEM) == 0)
     {
         std::printf("Failed to load client certificate. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
         return false;
     }
 
-    const std::string privateKeyFilePath = std::filesystem::path(clientCertPath_).replace_extension("key").string();
-    if (SSL_CTX_use_PrivateKey_file(ctx_, privateKeyFilePath.c_str(), SSL_FILETYPE_PEM) == 0)
+    if (SSL_CTX_use_PrivateKey_file(ctx_, clientPrivateKey_.c_str(), SSL_FILETYPE_PEM) == 0)
     {
         std::printf("Failed to load client private key. Reason - %s\n", ERR_reason_error_string(ERR_get_error()));
         return false;
